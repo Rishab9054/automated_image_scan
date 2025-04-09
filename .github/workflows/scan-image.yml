@@ -1,0 +1,26 @@
+name: Scan Docker Image
+
+on:
+  repository_dispatch:
+    types: [docker-image-pushed]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull Docker image
+        run: docker pull ${{ github.event.client_payload.image }}
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ github.event.client_payload.image }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      - name: Delete image if vulnerabilities are found
+        if: failure()
+        run: |
+          echo "Vulnerabilities found! Deleting image..."
+          docker rmi ${{ github.event.client_payload.image }}
