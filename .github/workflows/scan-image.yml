@@ -1,3 +1,4 @@
+
 name: Scan Docker Image
 
 on:
@@ -7,20 +8,33 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Pull Docker image
         run: docker pull ${{ github.event.client_payload.image }}
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ github.event.client_payload.image }}
-          format: table
-          exit-code: 1
-          severity: CRITICAL,HIGH
+        id: trivy_scan
+        run: |
+          echo "🔍 Starting vulnerability scan for image: ${{ github.event.client_payload.image }}"
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL,HIGH \
+            --format table \
+            ${{ github.event.client_payload.image }} | tee trivy-results.txt
+
+      - name: Show scan result summary
+        run: |
+          if [ "${{ steps.trivy_scan.outcome }}" == "failure" ]; then
+            echo "❌ Trivy scan failed: vulnerabilities found."
+            echo "📋 Showing summary:"
+            cat trivy-results.txt
+          else
+            echo "✅ Trivy scan passed: no critical/high vulnerabilities found."
+          fi
 
       - name: Delete image if vulnerabilities are found
         if: failure()
         run: |
-          echo "Vulnerabilities found! Deleting image..."
+          echo "🗑️ Deleting insecure Docker image..."
           docker rmi ${{ github.event.client_payload.image }}
