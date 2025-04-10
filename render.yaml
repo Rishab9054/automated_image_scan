@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: docker-webhook-trigger
+    env: python
+    plan: free
+    buildCommand: "pip install -r flask_webhook/requirements.txt"
+    startCommand: "python flask_webhook/app.py"
