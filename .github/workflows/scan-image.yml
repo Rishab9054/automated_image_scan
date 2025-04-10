@@ -1,4 +1,3 @@
-
 name: Scan Docker Image
 
 on:
@@ -15,6 +14,7 @@ jobs:
 
       - name: Scan image with Trivy
         id: trivy_scan
+        continue-on-error: true
         run: |
           echo "🔍 Starting vulnerability scan for image: ${{ github.event.client_payload.image }}"
           trivy image \
@@ -22,10 +22,13 @@ jobs:
             --severity CRITICAL,HIGH \
             --format table \
             ${{ github.event.client_payload.image }} | tee trivy-results.txt
+          
+          # Set the exit code as an output variable
+          echo "trivy_status=$?" >> $GITHUB_OUTPUT
 
       - name: Show scan result summary
         run: |
-          if [ "${{ steps.trivy_scan.outcome }}" == "failure" ]; then
+          if [ "${{ steps.trivy_scan.outputs.trivy_status }}" != "0" ]; then
             echo "❌ Trivy scan failed: vulnerabilities found."
             echo "📋 Showing summary:"
             cat trivy-results.txt
@@ -33,8 +36,25 @@ jobs:
             echo "✅ Trivy scan passed: no critical/high vulnerabilities found."
           fi
 
-      - name: Delete image if vulnerabilities are found
-        if: failure()
+      - name: Delete image from DockerHub if vulnerabilities are found
+        if: steps.trivy_scan.outputs.trivy_status != '0'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          echo "🗑️ Deleting insecure Docker image..."
-          docker rmi ${{ github.event.client_payload.image }}
+          echo "🗑️ Deleting insecure Docker image from DockerHub..."
+          # Parse the image name and tag
+          IMAGE_FULL="${{ github.event.client_payload.image }}"
+          IMAGE_NAME=$(echo $IMAGE_FULL | cut -d':' -f1)
+          IMAGE_TAG=$(echo $IMAGE_FULL | cut -d':' -f2)
+          
+          # Log in to DockerHub
+          echo $DOCKERHUB_TOKEN | docker login -u $DOCKERHUB_USERNAME --password-stdin
+          
+          # Delete the image using the DockerHub API
+          REPO_NAME=$(echo $IMAGE_NAME | cut -d'/' -f2-)
+          curl -X DELETE \
+            -H "Authorization: JWT $DOCKERHUB_TOKEN" \
+            "https://hub.docker.com/v2/repositories/${REPO_NAME}/tags/${IMAGE_TAG}/"
+          
+          echo "Image deleted from DockerHub successfully."

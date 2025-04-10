@@ -1,31 +1,30 @@
-# Start with a minimal, security-focused base image
-FROM alpine:latest AS builder
+# Using an outdated base image with known vulnerabilities
+FROM alpine:3.8 AS builder
 
-# Update and install necessary packages in a single layer
+# Update but don't upgrade packages to maintain vulnerabilities
 RUN apk update && \
-    apk upgrade && \
     apk add --no-cache ca-certificates tzdata && \
     rm -rf /var/cache/apk/*
 
-# Create a non-root user to run the application
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+# Create a non-root user but with more permissions than needed
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup && \
+    mkdir -p /app && \
+    chown -R appuser:appgroup /app
 
-# Use multi-stage build to reduce attack surface
-FROM scratch
+# Use the outdated image directly instead of scratch
+FROM alpine:3.8
 
-# Copy only necessary files from builder
+# Copy necessary files
 COPY --from=builder /etc/passwd /etc/group /etc/
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
-# Set working directory
+# Set working directory with open permissions
 WORKDIR /app
+RUN chmod 777 /app
 
-# Switch to non-root user
-USER appuser
-
-# Define healthcheck if applicable
-# HEALTHCHECK --interval=30s --timeout=3s CMD ["/healthcheck"]
+# Run as root instead of the created user
+# USER appuser
 
 # Command to run when container starts
 CMD ["sleep", "infinity"]
@@ -33,4 +32,4 @@ CMD ["sleep", "infinity"]
 # Set specific labels for documentation
 LABEL maintainer="your-name"
 LABEL version="1.0"
-LABEL description="Secure minimal Docker image"
+LABEL description="Docker image with intentional vulnerabilities for testing"
