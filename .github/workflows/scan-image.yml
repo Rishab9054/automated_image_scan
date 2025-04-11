@@ -1,69 +1,156 @@
 name: Scan Docker Image
 
+# Trigger Configuration: Runs when a repository_dispatch event with type 'docker-image-pushed' occurs
 on:
   repository_dispatch:
-    types: [docker-image-pushed]
+    types: [docker-image-pushed] # Expects payload: { "client_payload": { "image": "user/repo:tag" } }
 
 jobs:
+  # Define the 'scan' job
   scan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # Use the latest Ubuntu runner
 
-    steps:
+    steps: # List of steps for the 'scan' job
+      # Step 1: Pull the Docker image specified in the event payload
       - name: Pull Docker image
         run: docker pull ${{ github.event.client_payload.image }}
 
+      # Step 2: Install Trivy vulnerability scanner
       - name: Install Trivy
         run: |
+          # Install dependencies for adding repositories securely
           sudo apt-get update
           sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          # Add Aqua Security's GPG key using the recommended method
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          # Add the Trivy repository to apt sources
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          # Update package list and install Trivy
           sudo apt-get update
           sudo apt-get install -y trivy
 
+      # Step 3: Install jq (needed for parsing JSON from Docker Hub API)
+      - name: Install prerequisites (jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      # Step 4: Scan the Docker image using Trivy
       - name: Scan image with Trivy
-        id: trivy_scan
-        continue-on-error: true
+        id: trivy_scan # Give this step an ID to reference its outputs later
+        continue-on-error: true # Allow workflow to proceed even if Trivy finds vulnerabilities (exits with code 1)
         run: |
           echo "🔍 Starting vulnerability scan for image: ${{ github.event.client_payload.image }}"
+          # Run Trivy: exit code 1 if CRITICAL/HIGH vulns found, output table format, save to file
           trivy image \
             --exit-code 1 \
             --severity CRITICAL,HIGH \
             --format table \
             ${{ github.event.client_payload.image }} | tee trivy-results.txt
-          
-          # Set the exit code as an output variable
-          echo "trivy_status=$?" >> $GITHUB_OUTPUT
 
+          # Capture Trivy's exit code into a step output variable named 'trivy_status'
+          echo "trivy_status=$?" >> $GITHUB_OUTPUT
+          # Log the exit code for debugging
+          echo "Trivy scan exit code captured: $(echo $?)" # Note: This re-checks the last command (echo), better to rely on the variable below
+
+      # Step 5: Display a summary of the scan results based on Trivy's exit code
       - name: Show scan result summary
         run: |
+          # Access the output variable 'trivy_status' from the 'trivy_scan' step
           if [ "${{ steps.trivy_scan.outputs.trivy_status }}" != "0" ]; then
-            echo "❌ Trivy scan failed: vulnerabilities found."
-            echo "📋 Showing summary:"
+            echo "❌ Trivy scan failed: CRITICAL or HIGH severity vulnerabilities found."
+            echo "📋 Showing summary from trivy-results.txt:"
             cat trivy-results.txt
           else
-            echo "✅ Trivy scan passed: no critical/high vulnerabilities found."
+            echo "✅ Trivy scan passed: No CRITICAL or HIGH severity vulnerabilities found."
           fi
 
+      # Step 6: Delete the image tag from Docker Hub ONLY if vulnerabilities were found
       - name: Delete image from DockerHub if vulnerabilities are found
+        # Conditional execution: Only run if the 'trivy_status' output was not '0'
         if: steps.trivy_scan.outputs.trivy_status != '0'
-        env:
+        env: # Define environment variables available to the 'run' script
+          # Secrets must be configured in Repository Settings -> Secrets and variables -> Actions
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }} # Should be a Personal Access Token (PAT)
         run: |
-          echo "🗑️ Deleting insecure Docker image from DockerHub..."
-          # Parse the image name and tag
+          set -e # Exit the script immediately if any command fails
+
+          echo "Vulnerabilities found. Attempting to delete insecure Docker image from DockerHub..."
+
+          # --- Image Parsing ---
           IMAGE_FULL="${{ github.event.client_payload.image }}"
-          IMAGE_NAME=$(echo $IMAGE_FULL | cut -d':' -f1)
-          IMAGE_TAG=$(echo $IMAGE_FULL | cut -d':' -f2)
-          
-          # Log in to DockerHub
-          echo $DOCKERHUB_TOKEN | docker login -u $DOCKERHUB_USERNAME --password-stdin
-          
-          # Delete the image using the DockerHub API
+          echo "Raw image input: $IMAGE_FULL"
+
+          # Validate format: must contain '/' and ':'
+          if [[ ! "$IMAGE_FULL" == */*:* ]]; then
+            echo "::error::Invalid image format received: '$IMAGE_FULL'. Expected format: username/repository:tag"
+            exit 1
+          fi
+
+          IMAGE_NAME=$(echo $IMAGE_FULL | cut -d':' -f1) # e.g., username/repo
+          IMAGE_TAG=$(echo $IMAGE_FULL | cut -d':' -f2)  # e.g., latest
+          # Extract repository name part (e.g., repo) - assuming 'username/repo' structure
           REPO_NAME=$(echo $IMAGE_NAME | cut -d'/' -f2-)
-          curl -X DELETE \
-            -H "Authorization: JWT $DOCKERHUB_TOKEN" \
-            "https://hub.docker.com/v2/repositories/${REPO_NAME}/tags/${IMAGE_TAG}/"
-          
-          echo "Image deleted from DockerHub successfully."
+
+          echo "Parsed Image Name: ${IMAGE_NAME}"
+          echo "Parsed Image Tag: ${IMAGE_TAG}"
+          echo "Parsed Repository Name: ${REPO_NAME}"
+          echo "Using DockerHub Username from Secret: ${DOCKERHUB_USERNAME}"
+
+          # --- Docker Hub API Authentication ---
+          echo "Authenticating with Docker Hub API..."
+          LOGIN_PAYLOAD="{\"username\": \"$DOCKERHUB_USERNAME\", \"password\": \"$DOCKERHUB_TOKEN\"}"
+
+          # Make login request, fail fast (-f), silent (-s), capture response
+          AUTH_RES=$(curl -fs -H "Content-Type: application/json" -X POST -d "$LOGIN_PAYLOAD" https://hub.docker.com/v2/users/login/)
+
+          # Check if authentication response is empty (curl failed)
+          if [ -z "$AUTH_RES" ]; then
+              echo "::error::Authentication failed. No response from Docker Hub login API. Check network or API status (https://status.docker.com/)."
+              exit 1
+          fi
+
+          # Parse the JWT token from the JSON response using jq
+          AUTH_TOKEN=$(echo "$AUTH_RES" | jq -r .token)
+
+          # Validate the obtained token
+          if [ -z "$AUTH_TOKEN" ] || [ "$AUTH_TOKEN" == "null" ]; then
+            echo "::error::Failed to extract authentication token from Docker Hub response. Check DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (PAT) validity and permissions."
+            echo "Raw API Response: $AUTH_RES" # Log raw response for debugging
+            exit 1
+          else
+            echo "Authentication successful. JWT token obtained."
+          fi
+
+          # --- Docker Hub API Tag Deletion ---
+          echo "Sending DELETE request to Docker Hub API..."
+          # Construct the full API URL for the specific tag
+          # IMPORTANT: Assumes the repository belongs to the DOCKERHUB_USERNAME specified in secrets
+          API_URL="https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/${REPO_NAME}/tags/${IMAGE_TAG}/"
+          echo "Target API URL: ${API_URL}"
+
+          # Make DELETE request: silent (-s), discard body (-o /dev/null), write HTTP status code (-w), JWT auth header (-H)
+          delete_response_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            -H "Authorization: JWT ${AUTH_TOKEN}" \
+            "${API_URL}")
+
+          echo "API Response HTTP Code: $delete_response_code"
+
+          # Check the HTTP status code from the DELETE request
+          if [ "$delete_response_code" -ge 200 ] && [ "$delete_response_code" -lt 300 ]; then
+            # Success codes (e.g., 204 No Content)
+            echo "✅ Image tag '${IMAGE_TAG}' deleted successfully from DockerHub repository '${DOCKERHUB_USERNAME}/${REPO_NAME}'."
+          elif [ "$delete_response_code" == "401" ]; then
+             # Unauthorized
+             echo "::error::Failed to delete image tag (Unauthorized - 401). The PAT might lack 'Delete' permission for '${DOCKERHUB_USERNAME}/${REPO_NAME}' or the JWT expired."
+             exit 1
+          elif [ "$delete_response_code" == "404" ]; then
+             # Not Found
+             echo "::error::Failed to delete image tag (Not Found - 404). Verify that repository '${DOCKERHUB_USERNAME}/${REPO_NAME}' and tag '${IMAGE_TAG}' exist and the username is correct."
+             exit 1
+          else
+            # Other errors
+            echo "::error::Failed to delete image tag from DockerHub. Received unexpected HTTP Status Code: $delete_response_code"
+            exit 1
+          fi
