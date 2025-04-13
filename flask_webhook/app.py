@@ -4,7 +4,7 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-app = Flask(name)
+app = Flask(__name__)
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPO")
@@ -41,6 +41,6 @@ def webhook():
     else:
         return jsonify({"error": response.text}), 400
 
-if name == 'main':
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
