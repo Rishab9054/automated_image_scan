@@ -2,7 +2,6 @@ name: Scan Docker Image
 
 permissions:
   contents: read
-  secrets: write
 
 on:
   repository_dispatch:
@@ -13,6 +12,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
+      - name: Debug event payload
+        run: |
+          echo "Received repository_dispatch event"
+          echo "Event type: ${{ github.event.action }}"
+          echo "Docker image: ${{ github.event.client_payload.image }}"
+
       - name: Pull Docker image
         run: docker pull ${{ github.event.client_payload.image }}
 
@@ -35,28 +43,33 @@ jobs:
         continue-on-error: true
         run: |
           echo "🔍 Starting vulnerability scan for image: ${{ github.event.client_payload.image }}"
+          # Run Trivy in JSON format to process vulnerability counts
           trivy image \
             --exit-code 1 \
             --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
             --format json \
             ${{ github.event.client_payload.image }} > trivy-results.json
+          
+          # Generate human-readable output
           trivy image \
             --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
             --format table \
             ${{ github.event.client_payload.image }} | tee trivy-results.txt
+          
+          # Count vulnerabilities by severity
           CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json)
           HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json)
           MEDIUM_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results.json)
           LOW_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-results.json)
           UNKNOWN_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="UNKNOWN")] | length' trivy-results.json)
           TOTAL_COUNT=$((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT + UNKNOWN_COUNT))
+          
+          # Set status output (1 if vulnerabilities found, 0 if none)
           TRIVY_STATUS=$([ "$TOTAL_COUNT" -gt 0 ] && echo 1 || echo 0)
           echo "trivy_status=$TRIVY_STATUS" >> $GITHUB_OUTPUT
+          
           echo "Vulnerability Counts: CRITICAL=$CRITICAL_COUNT, HIGH=$HIGH_COUNT, MEDIUM=$MEDIUM_COUNT, LOW=$LOW_COUNT, UNKNOWN=$UNKNOWN_COUNT, TOTAL=$TOTAL_COUNT"
           echo "Trivy scan exit code: $TRIVY_STATUS"
-
-      - name: Debug Trivy Status
-        run: echo "Trivy status: ${{ steps.trivy_scan.outputs.trivy_status }}"
 
       - name: Show scan result summary
         run: |
@@ -76,40 +89,54 @@ jobs:
         run: |
           set -e
           echo "Vulnerabilities found. Attempting to delete insecure Docker image..."
+          
+          # Parse image name and tag
           IMAGE_FULL="${{ github.event.client_payload.image }}"
           echo "Raw image input: $IMAGE_FULL"
+          
+          # Validate format
           if [[ ! "$IMAGE_FULL" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+:[a-zA-Z0-9_.-]+$ ]]; then
             echo "::error::Invalid image format: '$IMAGE_FULL'. Expected: username/repository:tag"
             exit 1
           fi
+          
           IMAGE_NAME=$(echo $IMAGE_FULL | cut -d':' -f1)
           IMAGE_TAG=$(echo $IMAGE_FULL | cut -d':' -f2)
           REPO_NAME=$(echo $IMAGE_NAME | cut -d'/' -f2)
+          
           echo "DEBUG: IMAGE_NAME=$IMAGE_NAME"
           echo "DEBUG: REPO_NAME=$REPO_NAME"
           echo "DEBUG: IMAGE_TAG=$IMAGE_TAG"
-          echo "DEBUG: DOCKERHUB_USERNAME=$DOCKERHUB_USERNAME"
+          
           echo "Authenticating with Docker Hub API..."
           LOGIN_PAYLOAD="{\"username\": \"$DOCKERHUB_USERNAME\", \"password\": \"$DOCKERHUB_TOKEN\"}"
           AUTH_RES=$(curl -fs -H "Content-Type: application/json" -X POST -d "$LOGIN_PAYLOAD" https://hub.docker.com/v2/users/login/)
+          
           if [ -z "$AUTH_RES" ]; then
             echo "::error::Authentication failed. No response from Docker Hub login API."
             exit 1
           fi
+          
           AUTH_TOKEN=$(echo "$AUTH_RES" | jq -r .token)
+          
           if [ -z "$AUTH_TOKEN" ] || [ "$AUTH_TOKEN" == "null" ]; then
             echo "::error::Failed to extract authentication token. Check DOCKERHUB_USERNAME and DOCKERHUB_TOKEN."
             echo "Raw API Response: $AUTH_RES"
             exit 1
           fi
+          
           echo "Authentication successful."
+          
           echo "Sending DELETE request to Docker Hub API..."
           API_URL="https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/${REPO_NAME}/tags/${IMAGE_TAG}/"
           echo "Target API URL: ${API_URL}"
+          
           delete_response_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
             -H "Authorization: JWT ${AUTH_TOKEN}" \
             "${API_URL}")
+          
           echo "API Response HTTP Code: $delete_response_code"
+          
           if [ "$delete_response_code" -ge 200 ] && [ "$delete_response_code" -lt 300 ]; then
             echo "✅ Image tag '${IMAGE_TAG}' deleted successfully from '${DOCKERHUB_USERNAME}/${REPO_NAME}'."
           elif [ "$delete_response_code" == "401" ]; then
