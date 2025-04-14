@@ -1,7 +1,7 @@
 name: Scan Docker Image
 
 permissions:
-  contents: read
+  contents: read # Keep as read unless other steps need write access
 
 on:
   repository_dispatch:
@@ -13,8 +13,8 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-        
+        uses: actions/checkout@v3 # Or v4 if available/preferred
+
       - name: Debug event payload
         run: |
           echo "Received repository_dispatch event"
@@ -38,26 +38,39 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: Scan image with Trivy
-        id: trivy_scan
-        continue-on-error: true
+      - name: Scan image with Trivy (Generate Reports)
+        id: trivy_scan # Keep id if needed elsewhere, but outputs won't be used directly from here for status
+        continue-on-error: true # Still allow continuation if scan finds issues
         run: |
           echo "🔍 Starting vulnerability scan for image: ${{ github.event.client_payload.image }}"
-          
-          # Run Trivy in JSON format
+
+          # Run Trivy, exit with 1 on vulns, save JSON.
+          # The exit code here will be handled by continue-on-error.
           trivy image \
             --exit-code 1 \
             --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
             --format json \
             ${{ github.event.client_payload.image }} > trivy-results.json
 
-          # Generate human-readable summary
+          # Generate human-readable summary (run even if the first command exited > 0)
+          # Use --exit-code 0 here or ignore its exit code to ensure it runs
           trivy image \
+            --exit-code 0 \
             --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
             --format table \
-            ${{ github.event.client_payload.image }} | tee trivy-results.txt
-          
-          # Count vulnerabilities
+            ${{ github.event.client_payload.image }} > trivy-results.txt
+
+      - name: Check Scan Results and Set Status
+        id: scan_status # New ID for this step's output
+        run: |
+          if [ ! -f trivy-results.json ]; then
+            echo "::error::trivy-results.json not found. Scan may have failed critically."
+            # Set status to indicate failure explicitly if needed, or just let the job fail
+            # echo "trivy_status=error" >> "$GITHUB_OUTPUT"
+            exit 1 # Fail the job if the results file is missing
+          fi
+
+          echo "📊 Analyzing trivy-results.json..."
           CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json)
           HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json)
           MEDIUM_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-results.json)
@@ -65,23 +78,27 @@ jobs:
           UNKNOWN_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="UNKNOWN")] | length' trivy-results.json)
           TOTAL_COUNT=$((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT + UNKNOWN_COUNT))
 
-          # Set status output
+          echo "Vulnerability Counts: CRITICAL=$CRITICAL_COUNT, HIGH=$HIGH_COUNT, MEDIUM=$MEDIUM_COUNT, LOW=$LOW_COUNT, UNKNOWN=$UNKNOWN_COUNT, TOTAL=$TOTAL_COUNT"
+
+          # Set status output based purely on counts
           TRIVY_STATUS=$([ "$TOTAL_COUNT" -gt 0 ] && echo 1 || echo 0)
+          echo "Scan resulted in status: $TRIVY_STATUS (1=vulns found, 0=clean)"
           echo "trivy_status=$TRIVY_STATUS" >> "$GITHUB_OUTPUT"
 
-          echo "Vulnerability Counts: CRITICAL=$CRITICAL_COUNT, HIGH=$HIGH_COUNT, MEDIUM=$MEDIUM_COUNT, LOW=$LOW_COUNT, UNKNOWN=$UNKNOWN_COUNT, TOTAL=$TOTAL_COUNT"
-          echo "Trivy scan exit code: $TRIVY_STATUS"
-
       - name: Show scan result summary
+        # No need for the initial STATUS="" line from the log output in the actual YAML
         run: |
-          STATUS="${{ steps.trivy_scan.outputs.trivy_status }}"
+          # Get status from the dedicated 'scan_status' step
+          STATUS="${{ steps.scan_status.outputs.trivy_status }}"
+
+          # Check if status is empty (shouldn't happen with the check in previous step, but good safeguard)
           if [ -z "$STATUS" ]; then
-            echo "::error::Missing Trivy status output. Scan may have failed."
+            echo "::error::Failed to determine Trivy status output."
             exit 1
           fi
 
           if [ "$STATUS" != "0" ]; then
-            echo "❌ Trivy scan found vulnerabilities."
+            echo "❌ Trivy scan found vulnerabilities ($TOTAL_COUNT total)." # Use count if available or just message
             if [ -f trivy-results.txt ]; then
               echo "📋 Showing summary from trivy-results.txt:"
               cat trivy-results.txt
@@ -89,54 +106,62 @@ jobs:
               echo "::warning::trivy-results.txt not found."
             fi
           else
-            echo "✅ Trivy scan passed: No vulnerabilities found."
+            echo "✅ Trivy scan passed: No vulnerabilities found matching severity criteria."
           fi
 
       - name: Delete image from DockerHub if vulnerabilities are found
-        if: steps.trivy_scan.outputs.trivy_status != '0' && steps.trivy_scan.outputs.trivy_status != ''
+        # Update the 'if' condition to use the new step's output
+        if: steps.scan_status.outputs.trivy_status == '1'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          set -e
+          set -e # Keep this to fail fast on errors within the script
           echo "Vulnerabilities found. Attempting to delete insecure Docker image..."
 
           IMAGE_FULL="${{ github.event.client_payload.image }}"
           echo "Raw image input: $IMAGE_FULL"
 
+          # Consider making regex slightly more flexible if needed, e.g. for slashes in username/repo
           if [[ ! "$IMAGE_FULL" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+:[a-zA-Z0-9_.-]+$ ]]; then
-            echo "::error::Invalid image format: '$IMAGE_FULL'. Expected: username/repository:tag"
+            echo "::error::Invalid image format: '$IMAGE_FULL'. Expected format like: username/repository:tag"
             exit 1
           fi
 
+          # Parsing logic seems okay for simple user/repo:tag
           IMAGE_NAME=$(echo $IMAGE_FULL | cut -d':' -f1)
           IMAGE_TAG=$(echo $IMAGE_FULL | cut -d':' -f2)
-          REPO_NAME=$(echo $IMAGE_NAME | cut -d'/' -f2)
+          # Ensure DOCKERHUB_USERNAME is used for the repo path if it's always user-owned repos
+          REPO_NAME=$(echo $IMAGE_NAME | sed "s|^${DOCKERHUB_USERNAME}/||") # Extract repo name relative to user
 
-          echo "DEBUG: IMAGE_NAME=$IMAGE_NAME"
-          echo "DEBUG: REPO_NAME=$REPO_NAME"
-          echo "DEBUG: IMAGE_TAG=$IMAGE_TAG"
+          # Add more robust parsing if image names can be complex (e.g., handle quay.io/..., docker.io/..., etc.)
 
+          echo "DEBUG: Full Image=$IMAGE_FULL"
+          echo "DEBUG: Extracted Image Name (user/repo)=$IMAGE_NAME"
+          echo "DEBUG: Extracted Repo Name=$REPO_NAME"
+          echo "DEBUG: Extracted Image Tag=$IMAGE_TAG"
+          echo "DEBUG: Using DockerHub Username=$DOCKERHUB_USERNAME for API path"
+
+          # Rest of the deletion script... (Authentication and DELETE request)
           echo "Authenticating with Docker Hub API..."
           LOGIN_PAYLOAD="{\"username\": \"$DOCKERHUB_USERNAME\", \"password\": \"$DOCKERHUB_TOKEN\"}"
-          AUTH_RES=$(curl -fs -H "Content-Type: application/json" -X POST -d "$LOGIN_PAYLOAD" https://hub.docker.com/v2/users/login/)
+          AUTH_RES=$(curl -fsS -H "Content-Type: application/json" -X POST -d "$LOGIN_PAYLOAD" https://hub.docker.com/v2/users/login/) # Added -S for better curl errors
 
           if [ -z "$AUTH_RES" ]; then
             echo "::error::Authentication failed. No response from Docker Hub login API."
             exit 1
           fi
 
-          AUTH_TOKEN=$(echo "$AUTH_RES" | jq -r .token)
+          AUTH_TOKEN=$(echo "$AUTH_RES" | jq -re .token) # Added -e to exit if .token is null/false
 
-          if [ -z "$AUTH_TOKEN" ] || [ "$AUTH_TOKEN" == "null" ]; then
-            echo "::error::Failed to extract authentication token. Check DOCKERHUB_USERNAME and DOCKERHUB_TOKEN."
-            echo "Raw API Response: $AUTH_RES"
+          if [ -z "$AUTH_TOKEN" ]; then
+            echo "::error::Failed to extract authentication token. Check DOCKERHUB_USERNAME and DOCKERHUB_TOKEN. Raw Response: $AUTH_RES"
             exit 1
           fi
-
           echo "Authentication successful."
 
           echo "Sending DELETE request to Docker Hub API..."
+          # Ensure the URL uses the correct username from secrets, not parsed from image if different
           API_URL="https://hub.docker.com/v2/repositories/${DOCKERHUB_USERNAME}/${REPO_NAME}/tags/${IMAGE_TAG}/"
           echo "Target API URL: ${API_URL}"
 
@@ -146,15 +171,17 @@ jobs:
 
           echo "API Response HTTP Code: $delete_response_code"
 
+          # Check response code (logic seems okay)
           if [ "$delete_response_code" -ge 200 ] && [ "$delete_response_code" -lt 300 ]; then
             echo "✅ Image tag '${IMAGE_TAG}' deleted successfully from '${DOCKERHUB_USERNAME}/${REPO_NAME}'."
           elif [ "$delete_response_code" == "401" ]; then
-            echo "::error::Failed to delete image tag (Unauthorized - 401). Check PAT permissions."
+            echo "::error::Failed to delete image tag (Unauthorized - 401). Check Docker Hub token permissions."
             exit 1
           elif [ "$delete_response_code" == "404" ]; then
-            echo "::error::Failed to delete image tag (Not Found - 404). Verify repository and tag."
+            echo "::error::Failed to delete image tag (Not Found - 404). Verify repository '${DOCKERHUB_USERNAME}/${REPO_NAME}' and tag '${IMAGE_TAG}' exist."
             exit 1
           else
             echo "::error::Failed to delete image tag. HTTP Status Code: $delete_response_code"
+            # Optionally print response body for more detail: curl -v ...
             exit 1
           fi
