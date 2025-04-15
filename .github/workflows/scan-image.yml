@@ -1,7 +1,7 @@
 name: Scan Docker Image
 
 permissions:
-  contents: read # Keep as read unless other steps need write access
+  contents: read 
 
 on:
   repository_dispatch:
@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3 # Or v4 if available/preferred
+        uses: actions/checkout@v3 
 
       - name: Debug event payload
         run: |
@@ -39,8 +39,8 @@ jobs:
           sudo apt-get install -y jq
 
       - name: Scan image with Trivy (Generate Reports)
-        id: trivy_scan # Keep id if needed elsewhere, but outputs won't be used directly from here for status
-        continue-on-error: true # Still allow continuation if scan finds issues
+        id: trivy_scan 
+        continue-on-error: true 
         run: |
           echo "🔍 Starting vulnerability scan for image: ${{ github.event.client_payload.image }}"
 
@@ -61,7 +61,7 @@ jobs:
             ${{ github.event.client_payload.image }} > trivy-results.txt
 
       - name: Check Scan Results and Set Status
-        id: scan_status # New ID for this step's output
+        id: scan_status 
         run: |
           if [ ! -f trivy-results.json ]; then
             echo "::error::trivy-results.json not found. Scan may have failed critically."
@@ -86,7 +86,7 @@ jobs:
           echo "trivy_status=$TRIVY_STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Show scan result summary
-        # No need for the initial STATUS="" line from the log output in the actual YAML
+        
         run: |
           # Get status from the dedicated 'scan_status' step
           STATUS="${{ steps.scan_status.outputs.trivy_status }}"
@@ -110,7 +110,7 @@ jobs:
           fi
 
       - name: Delete image from DockerHub if vulnerabilities are found
-        # Update the 'if' condition to use the new step's output
+        
         if: steps.scan_status.outputs.trivy_status == '1'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
